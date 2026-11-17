@@ -182,45 +182,25 @@ jobs:
              python3 contribs_builder_qt.py --targets=android_armv8,android_armv7,android_x86_64 --software qtmqtt,qtconnectivity --qt-directory "${QT_ROOT_DIR}/../.." --qt-version "${QT_VERSION}"
              python3 contribs_builder.py --targets=android_armv8,android_armv7,android_x86_64 --software mbedtls --qt-directory "${QT_ROOT_DIR}/../.." --qt-version "${QT_VERSION}"
 
-      # Decode signing keystore (release-track runs only)
-      - name: Decode signing keystore
-        if: env.DISTRIBUTE == 'true'
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      # Throwaway signing key so the APK is installable (sideload). No secrets needed.
+      - name: Create a local signing keystore
         run: |
-             # Re-register sensitive values for the runner's log-masking filter
-             # so they get redacted in every subsequent step's stdout/stderr,
-             # not just steps that consume them via ${{ secrets.* }} interpolation.
-             echo "::add-mask::$ANDROID_KEYSTORE_PASSWORD"
-             echo "::add-mask::$ANDROID_KEY_PASSWORD"
-             echo "::add-mask::$ANDROID_KEY_ALIAS"
-             echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.keystore"
+             keytool -genkeypair -v -keystore "$RUNNER_TEMP/local.keystore" -alias local -keyalg RSA -keysize 2048 -validity 10000 \
+               -storepass theengslocal -keypass theengslocal -dname "CN=local build"
              {
-               echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/upload.keystore"
-               echo "ANDROID_KEYSTORE_PASSWORD=$ANDROID_KEYSTORE_PASSWORD"
-               echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
-               echo "ANDROID_KEY_PASSWORD=$ANDROID_KEY_PASSWORD"
+               echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/local.keystore"
+               echo "ANDROID_KEYSTORE_PASSWORD=theengslocal"
+               echo "ANDROID_KEY_ALIAS=local"
+               echo "ANDROID_KEY_PASSWORD=theengslocal"
              } >> "$GITHUB_ENV"
 
       # Build application (compile-only for PRs, AAB for release branch / tags).
       # On release-track runs, pass QT_ANDROID_KEYSTORE_* so Qt's androiddeployqt
       # injects --sign into the gradle invocation it spawns. Do NOT mirror this
       # with a gradle signingConfigs block — Qt expects to own the signing.
-      - name: Build application
+      - name: Build application (signed APK)
         run: |
              "${QT_TARGET_PATH}/bin/qt-cmake" --version
-             SIGN_ARGS=()
-             if [ "$DISTRIBUTE" = "true" ]; then
-               SIGN_ARGS=(
-                 -DQT_ANDROID_KEYSTORE_PATH="${ANDROID_KEYSTORE_PATH}"
-                 -DQT_ANDROID_KEYSTORE_ALIAS="${ANDROID_KEY_ALIAS}"
-                 -DQT_ANDROID_KEYSTORE_STORE_PASS="${ANDROID_KEYSTORE_PASSWORD}"
-                 -DQT_ANDROID_KEYSTORE_KEY_PASS="${ANDROID_KEY_PASSWORD}"
-               )
-             fi
              "${QT_TARGET_PATH}/bin/qt-cmake" -B build/ -G Ninja \
                -DCMAKE_SYSTEM_NAME=Android \
                -DCMAKE_BUILD_TYPE=Release \
@@ -231,13 +211,36 @@ jobs:
                -DANDROID_PLATFORM=android-28 \
                -DQT_HOST_PATH:PATH="${QT_HOST_PATH}" \
                -DQT_ANDROID_BUILD_ALL_ABIS=OFF \
-               -DQT_ANDROID_ABIS="arm64-v8a;armeabi-v7a;x86_64" \
-               "${SIGN_ARGS[@]}"
-             if [ "$DISTRIBUTE" = "true" ]; then
-               cmake --build build/ --target aab
-             else
-               cmake --build build/ --config Release
-             fi
+               -DQT_ANDROID_ABIS="arm64-v8a;armeabi-v7a" \
+               -DQT_ANDROID_KEYSTORE_PATH="${ANDROID_KEYSTORE_PATH}" \
+               -DQT_ANDROID_KEYSTORE_ALIAS="${ANDROID_KEY_ALIAS}" \
+               -DQT_ANDROID_KEYSTORE_STORE_PASS="${ANDROID_KEYSTORE_PASSWORD}" \
+               -DQT_ANDROID_KEYSTORE_KEY_PASS="${ANDROID_KEY_PASSWORD}"
+             cmake --build build/ --target apk
+             echo "---- APKs produced:"; find build -name "*.apk" -print
+
+      # Qt doesn't pick the keystore up from -D flags (see upstream notes), so the
+      # apk target lands unsigned. zipalign + apksigner it ourselves.
+      - name: Sign APK
+        run: |
+             BT="$ANDROID_SDK_ROOT/build-tools/36.1.0"
+             [ -x "$BT/apksigner" ] || BT="$(dirname "$(find "$ANDROID_SDK_ROOT/build-tools" -name apksigner | sort | tail -n1)")"
+             IN="$(find build -name '*.apk' ! -name '*signed*' | head -n1)"
+             echo "signing: $IN  with tools in $BT"
+             mkdir -p out
+             "$BT/zipalign" -p -f 4 "$IN" out/aligned.apk
+             "$BT/apksigner" sign --ks "$ANDROID_KEYSTORE_PATH" --ks-key-alias "$ANDROID_KEY_ALIAS" \
+               --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" --key-pass "pass:$ANDROID_KEY_PASSWORD" \
+               --out "out/Theengs-${APP_VERSION}-signed.apk" out/aligned.apk
+             "$BT/apksigner" verify --print-certs "out/Theengs-${APP_VERSION}-signed.apk"
+             ls -la out/
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: theengs-apk
+          path: out/Theengs-*-signed.apk
+          if-no-files-found: error
 
       # Post-mortem if the AAB target failed: list outputs and surface any
       # extra log files androiddeployqt may have produced (silent exit-20 case).
@@ -256,216 +259,3 @@ jobs:
              echo
              echo "===== gradle reports (if any errors) ====="
              find build/android-build/build/reports/ -type f -name '*.html' 2>&1 | head -10 || true
-
-      # Sign the AAB with jarsigner. Qt's QT_ANDROID_KEYSTORE_* CMake vars are
-      # read as target properties (not variables), so the -D flags we pass to
-      # qt-cmake don't propagate into androiddeployqt's --sign injection, and
-      # the AAB lands at outputs/bundle/release/ unsigned. Sign it ourselves
-      # using -storepass:env / -keypass:env so passwords never appear on argv.
-      - name: Sign AAB with jarsigner
-        if: env.DISTRIBUTE == 'true'
-        run: |
-             AAB=$(ls build/android-build/build/outputs/bundle/release/*.aab | head -n1)
-             echo "Signing: $AAB"
-             jarsigner -sigalg SHA256withRSA -digestalg SHA-256 \
-               -keystore "$ANDROID_KEYSTORE_PATH" \
-               -storepass:env ANDROID_KEYSTORE_PASSWORD \
-               -keypass:env ANDROID_KEY_PASSWORD \
-               "$AAB" "$ANDROID_KEY_ALIAS"
-             # Verify the signature. Do NOT use -strict: Android upload keys
-             # are self-signed by design, and -strict treats self-signed certs
-             # plus the missing TSA timestamp as errors. "jar verified" without
-             # a non-zero exit is what we need; the self-signed / no-timestamp
-             # warnings are expected and benign for Play Console uploads.
-             echo "Verifying signature..."
-             jarsigner -verify "$AAB"
-
-      # Upload AAB to Play Console (Internal testing track)
-      - name: Upload AAB to Play Console
-        if: env.DISTRIBUTE == 'true'
-        uses: r0adkll/upload-google-play@v1
-        with:
-          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
-          packageName: com.theengs.app
-          releaseFiles: build/android-build/build/outputs/bundle/release/*.aab
-          tracks: internal
-          status: completed
-          whatsNewDirectory: distribution/whatsnew
-
-  ## iOS build #################################################################
-  build-ios:
-    name: "iOS CI build"
-    # macos-latest tracks GitHub's current macOS image and ships the most recent
-    # Xcode. App Store Connect now requires builds against the iOS 26 SDK
-    # (Xcode 26+); macos-15 with Xcode 16.x is rejected at upload validation.
-    runs-on: macos-latest
-    env:
-      DISTRIBUTE: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/development' || startsWith(github.ref, 'refs/tags/v')) && github.repository == 'theengs/app' }}
-      REPO_NAME: ${{ github.event.repository.name }}
-    steps:
-      # Checkout repository (and submodules)
-      - name: Checkout repository (and submodules)
-        uses: actions/checkout@v5
-        with:
-          submodules: recursive
-          fetch-depth: 0     # needed so `git describe` can read the TheengsDecoder submodule tag
-
-      # Pin Xcode to the latest stable version available on the runner so
-      # builds are reproducible and we get the iOS 26+ SDK that App Store
-      # Connect now requires for uploads.
-      - name: Select latest Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      # Install Qt (desktop & iOS)
-      - name: Install Qt (desktop & iOS)
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: ${{env.QT_VERSION}}
-          host: 'mac'
-          target: 'ios'
-          extra: '--autodesktop'
-          modules: qtconnectivity qtwebsockets qtcharts
-
-      # Install dependencies (from package manager)
-      #- name: Install dependencies (from package manager)
-      #  run: |
-      #       brew install cmake ninja
-
-      # Setup env
-      - name: Setup env
-        run: |
-             echo "QT_HOST_PATH=/Users/runner/work/${REPO_NAME}/Qt/${QT_VERSION}/macos" >> "$GITHUB_ENV"
-             echo "QT_TARGET_PATH=/Users/runner/work/${REPO_NAME}/Qt/${QT_VERSION}/ios" >> "$GITHUB_ENV"
-             qmake --version
-             cmake --version
-             ninja --version
-
-      # Derive marketing version from tag (no-op on non-tag pushes)
-      - name: Resolve version from tag
-        run: bash scripts/ci-resolve-version.sh ios
-
-      # Build dependencies (from contribs script)
-      - name: Build dependencies (from contribs script)
-        run: |
-             cd contribs/
-             python3 contribs_builder_qt.py --targets=ios_armv8 --software qtmqtt --qt-directory "${QT_ROOT_DIR}/../.." --qt-version "${QT_VERSION}"
-
-      # Patch CFBundleVersion to a monotonic value that strictly exceeds the
-      # previously published build (Info.plist ships with 01060001). Using a
-      # YYMMDDHHMM timestamp gives ~10-digit values like 2605110830 — always
-      # higher than any prior, always increasing, always unique per run.
-      - name: Patch iOS build number
-        if: env.DISTRIBUTE == 'true'
-        run: |
-             NEW_BUILD=$(date +%y%m%d%H%M)
-             /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${NEW_BUILD}" assets/ios/Info.plist
-             /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" assets/ios/Info.plist
-
-      # Import App Store distribution signing certificate
-      - name: Import signing certificate
-        if: env.DISTRIBUTE == 'true'
-        uses: apple-actions/import-codesign-certs@v7
-        with:
-          p12-file-base64: ${{ secrets.APPLE_DIST_CERT_P12_BASE64 }}
-          p12-password: ${{ secrets.APPLE_DIST_CERT_PASSWORD }}
-
-      # Download App Store provisioning profile via App Store Connect API
-      - name: Download provisioning profile
-        if: env.DISTRIBUTE == 'true'
-        id: provisioning
-        uses: apple-actions/download-provisioning-profiles@v6
-        with:
-          bundle-id: com.theengs.app
-          profile-type: IOS_APP_STORE
-          issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
-          api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
-          api-private-key: ${{ secrets.APPSTORE_PRIVATE_KEY }}
-
-      # Configure the Xcode project (signing only for release-track runs)
-      - name: Configure project
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-             if [ "$DISTRIBUTE" = "true" ]; then
-               "${QT_TARGET_PATH}/bin/qt-cmake" -B build/ -G Xcode \
-                 -DCMAKE_SYSTEM_NAME=iOS \
-                 -DCMAKE_BUILD_TYPE=Release \
-                 -DCMAKE_FIND_ROOT_PATH:PATH="${QT_TARGET_PATH}" \
-                 -DCMAKE_PREFIX_PATH:PATH="${QT_TARGET_PATH}" \
-                 -DQT_HOST_PATH:PATH="${QT_HOST_PATH}" \
-                 -DCMAKE_XCODE_ATTRIBUTE_DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
-                 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_STYLE=Manual \
-                 -DCMAKE_XCODE_ATTRIBUTE_PROVISIONING_PROFILE_SPECIFIER="Theengs App Store" \
-                 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY="Apple Distribution"
-             else
-               "${QT_TARGET_PATH}/bin/qt-cmake" -B build/ -G Xcode \
-                 -DCMAKE_SYSTEM_NAME=iOS \
-                 -DCMAKE_BUILD_TYPE=Release \
-                 -DCMAKE_FIND_ROOT_PATH:PATH="${QT_TARGET_PATH}" \
-                 -DCMAKE_PREFIX_PATH:PATH="${QT_TARGET_PATH}" \
-                 -DQT_HOST_PATH:PATH="${QT_HOST_PATH}" \
-                 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED="NO"
-             fi
-
-      # Compile-only path (PRs / forks / non-release branches)
-      - name: Build application (compile only)
-        if: env.DISTRIBUTE != 'true'
-        run: cmake --build build/ --config Release -- CODE_SIGNING_ALLOWED=NO
-
-      # Archive + export IPA (release-track runs only)
-      - name: Archive and export IPA
-        if: env.DISTRIBUTE == 'true'
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
-          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
-          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
-        run: |
-             # Mask sensitive App Store Connect API values across all subsequent
-             # log output (defense in depth on top of GitHub's built-in masking).
-             echo "::add-mask::$APPLE_TEAM_ID"
-             echo "::add-mask::$APPSTORE_ISSUER_ID"
-             echo "::add-mask::$APPSTORE_KEY_ID"
-
-             # Resolve the profile NAME from the downloaded .mobileprovision file.
-             PROFILE_FILE=$(ls -1 "$HOME/Library/MobileDevice/Provisioning Profiles/"*.mobileprovision | head -n1)
-             security cms -D -i "$PROFILE_FILE" > /tmp/profile.plist
-             PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print :Name" /tmp/profile.plist)
-             echo "Using provisioning profile: $PROFILE_NAME"
-
-             # Materialise ExportOptions.plist with concrete values
-             sed -e "s/__TEAM_ID__/${APPLE_TEAM_ID}/g" \
-                 -e "s|__PROFILE_NAME__|${PROFILE_NAME}|g" \
-                 distribution/ios/ExportOptions.plist > build/ExportOptions.plist
-
-             # Materialise the App Store Connect API private key on disk so
-             # xcodebuild can authenticate during -exportArchive. Without this,
-             # exportArchive fails with "Failed to Use Accounts" because no
-             # Apple ID is signed into the runner.
-             ASC_KEY_DIR="$RUNNER_TEMP/asc-keys"
-             mkdir -p "$ASC_KEY_DIR"
-             ASC_KEY_PATH="$ASC_KEY_DIR/AuthKey_${APPSTORE_KEY_ID}.p8"
-             printf '%s' "$APPSTORE_PRIVATE_KEY" > "$ASC_KEY_PATH"
-             chmod 600 "$ASC_KEY_PATH"
-
-             xcodebuild -project build/Theengs.xcodeproj \
-                        -scheme Theengs \
-                        -configuration Release \
-                        -destination 'generic/platform=iOS' \
-                        -archivePath build/Theengs.xcarchive \
-                        -allowProvisioningUpdates \
-                        -authenticationKeyID "$APPSTORE_KEY_ID" \
-                        -authenticationKeyIssuerID "$APPSTORE_ISSUER_ID" \
-                        -authenticationKeyPath "$ASC_KEY_PATH" \
-                        archive
-
-             xcodebuild -exportArchive \
-                        -archivePath build/Theengs.xcarchive \
-                        -exportPath build/ipa \
-                        -exportOptionsPlist build/ExportOptions.plist \
-                        -allowProvisioningUpdates \
-                        -authenticationKeyID "$APPSTORE_KEY_ID" \
-                        -authenticationKeyIssuerID "$APPSTORE_ISSUER_ID" \
-                        -authenticationKeyPath "$ASC_KEY_PATH"
